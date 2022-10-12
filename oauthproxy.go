@@ -83,7 +83,8 @@ type OAuthProxy struct {
 	apiRoutes           []apiRoute
 	redirectURL         *url.URL // the url to receive requests at
 	whitelistDomains    []string
-	provider            providers.Provider
+	providerMap         providers.ProviderMap
+	defaultProvider     string
 	sessionStore        sessionsapi.SessionStore
 	ProxyPrefix         string
 	basicAuthValidator  basic.Validator
@@ -123,9 +124,18 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		}
 	}
 
-	provider, err := providers.NewProvider(opts.Providers[0])
+	providerMap, err := providers.NewProviderMap(opts.Providers)
 	if err != nil {
-		return nil, fmt.Errorf("error intiailising provider: %v", err)
+		return nil, fmt.Errorf("error intialising providers: %v", err)
+	}
+
+	providerNameArray := make([]string, 0)
+	providerIDArray := make([]string, 0)
+
+	for i := range opts.Providers {
+
+		providerNameArray = append(providerNameArray, opts.Providers[i].Name)
+		providerIDArray = append(providerIDArray, opts.Providers[i].ID)
 	}
 
 	pageWriter, err := pagewriter.NewWriter(pagewriter.Opts{
@@ -135,7 +145,8 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		Footer:           opts.Templates.Footer,
 		Version:          VERSION,
 		Debug:            opts.Templates.Debug,
-		ProviderName:     buildProviderName(provider, opts.Providers[0].Name),
+		ProviderName:     providerNameArray,
+		ProviderID:       providerIDArray,
 		SignInMessage:    buildSignInMessage(opts),
 		DisplayLoginForm: basicAuthValidator != nil && opts.Templates.DisplayLoginForm,
 	})
@@ -154,13 +165,17 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 			logger.Printf("Skipping JWT tokens from extra JWT issuer: %q", issuer)
 		}
 	}
+
 	redirectURL := opts.GetRedirectURL()
 	if redirectURL.Path == "" {
 		redirectURL.Path = fmt.Sprintf("%s/callback", opts.ProxyPrefix)
 	}
 
-	logger.Printf("OAuthProxy configured for %s Client ID: %s", provider.Data().ProviderName, opts.Providers[0].ClientID)
 	refresh := "disabled"
+	for key := range providerMap {
+		logger.Printf("OAuthProxy configured for %s Client ID: %s", providerMap[key].Data().ProviderName, providerMap[key].Data().ClientID)
+	}
+
 	if opts.Cookie.Refresh != time.Duration(0) {
 		refresh = fmt.Sprintf("after %s", opts.Cookie.Refresh)
 	}
@@ -190,7 +205,7 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 	if err != nil {
 		return nil, fmt.Errorf("could not build pre-auth chain: %v", err)
 	}
-	sessionChain := buildSessionChain(opts, provider, sessionStore, basicAuthValidator)
+	sessionChain := buildSessionChain(opts, providerMap, sessionStore, basicAuthValidator)
 	headersChain, err := buildHeadersChain(opts)
 	if err != nil {
 		return nil, fmt.Errorf("could not build headers chain: %v", err)
@@ -209,7 +224,8 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		SignInPath: fmt.Sprintf("%s/sign_in", opts.ProxyPrefix),
 
 		ProxyPrefix:         opts.ProxyPrefix,
-		provider:            provider,
+		providerMap:         providerMap,
+		defaultProvider:     opts.DefaultProvider,
 		sessionStore:        sessionStore,
 		redirectURL:         redirectURL,
 		apiRoutes:           apiRoutes,
@@ -319,6 +335,7 @@ func (p *OAuthProxy) buildProxySubrouter(s *mux.Router) {
 	s.Path(signInPath).HandlerFunc(p.SignIn)
 	s.Path(signOutPath).HandlerFunc(p.SignOut)
 	s.Path(oauthStartPath).HandlerFunc(p.OAuthStart)
+	s.Path("/{id}" + oauthStartPath).HandlerFunc(p.OAuthStart)
 	s.Path(oauthCallbackPath).HandlerFunc(p.OAuthCallback)
 
 	// The userinfo endpoint needs to load sessions before handling the request
@@ -366,12 +383,15 @@ func buildPreAuthChain(opts *options.Options) (alice.Chain, error) {
 	return chain, nil
 }
 
-func buildSessionChain(opts *options.Options, provider providers.Provider, sessionStore sessionsapi.SessionStore, validator basic.Validator) alice.Chain {
+func buildSessionChain(opts *options.Options, providerMap providers.ProviderMap, sessionStore sessionsapi.SessionStore, validator basic.Validator) alice.Chain {
 	chain := alice.New()
 
 	if opts.SkipJwtBearerTokens {
-		sessionLoaders := []middlewareapi.TokenToSessionFunc{
-			provider.CreateSessionFromToken,
+
+		var sessionLoaders []middlewareapi.TokenToSessionFunc
+
+		for k := range providerMap {
+			sessionLoaders = append(sessionLoaders, providerMap[k].CreateSessionFromToken)
 		}
 
 		for _, verifier := range opts.GetJWTBearerVerifiers() {
@@ -387,10 +407,9 @@ func buildSessionChain(opts *options.Options, provider providers.Provider, sessi
 	}
 
 	chain = chain.Append(middleware.NewStoredSessionLoader(&middleware.StoredSessionLoaderOptions{
-		SessionStore:    sessionStore,
-		RefreshPeriod:   opts.Cookie.Refresh,
-		RefreshSession:  provider.RefreshSession,
-		ValidateSession: provider.ValidateSession,
+		SessionStore:  sessionStore,
+		RefreshPeriod: opts.Cookie.Refresh,
+		ProviderMap:   providerMap,
 	}))
 
 	return chain
@@ -428,16 +447,10 @@ func buildSignInMessage(opts *options.Options) string {
 	return msg
 }
 
-func buildProviderName(p providers.Provider, override string) string {
-	if override != "" {
-		return override
-	}
-	return p.Data().ProviderName
-}
-
 // buildRoutesAllowlist builds an []allowedRoute  list from either the legacy
 // SkipAuthRegex option (paths only support) or newer SkipAuthRoutes option
 // (method=path support)
+
 func buildRoutesAllowlist(opts *options.Options) ([]allowedRoute, error) {
 	routes := make([]allowedRoute, 0, len(opts.SkipAuthRegex)+len(opts.SkipAuthRoutes))
 
@@ -590,7 +603,10 @@ func (p *OAuthProxy) isTrustedIP(req *http.Request) bool {
 	remoteAddr, err := ip.GetClientIP(p.realClientIPParser, req)
 	if err != nil {
 		logger.Errorf("Error obtaining real IP for trusted IP list: %v", err)
-		// Possibly spoofed X-Real-IP header
+		// Possibly spoofed X-Real-IP header// if opts.SkipJwtBearerTokens {
+		// 	sessionLoaders := []middlewareapi.TokenToSessionFunc{
+		// 		providerMap.CreateSessionFromToken,
+		// 	}
 		return false
 	}
 
@@ -697,11 +713,13 @@ func (p *OAuthProxy) UserInfo(rw http.ResponseWriter, req *http.Request) {
 		Email             string   `json:"email"`
 		Groups            []string `json:"groups,omitempty"`
 		PreferredUsername string   `json:"preferredUsername,omitempty"`
+		ProviderID        string   `json:"providerID"`
 	}{
 		User:              session.User,
 		Email:             session.Email,
 		Groups:            session.Groups,
 		PreferredUsername: session.PreferredUsername,
+		ProviderID:        session.ProviderID,
 	}
 
 	if err := json.NewEncoder(rw).Encode(userInfo); err != nil {
@@ -730,16 +748,32 @@ func (p *OAuthProxy) SignOut(rw http.ResponseWriter, req *http.Request) {
 // OAuthStart starts the OAuth2 authentication flow
 func (p *OAuthProxy) OAuthStart(rw http.ResponseWriter, req *http.Request) {
 	// start the flow permitting login URL query parameters to be overridden from the request URL
-	p.doOAuthStart(rw, req, req.URL.Query())
+
+	params := mux.Vars(req)
+	providerID := (params["id"])
+
+	if providerID == "" {
+		p.doOAuthStart(rw, req, p.defaultProvider, req.URL.Query())
+	} else {
+		if _, ok := p.providerMap[providerID]; ok {
+			p.doOAuthStart(rw, req, providerID, req.URL.Query())
+		} else {
+			logger.Errorf("Error while converting id %v from path: %v", providerID, req.URL.Path)
+			p.ErrorPage(rw, req, http.StatusNotFound, "Start Path does not match a provider ID")
+			return
+		}
+
+	}
 }
 
-func (p *OAuthProxy) doOAuthStart(rw http.ResponseWriter, req *http.Request, overrides url.Values) {
-	extraParams := p.provider.Data().LoginURLParams(overrides)
+func (p *OAuthProxy) doOAuthStart(rw http.ResponseWriter, req *http.Request, providerID string, overrides url.Values) {
+
+	extraParams := p.providerMap[providerID].Data().LoginURLParams(overrides)
 	prepareNoCache(rw)
 
 	var codeChallenge, codeVerifier, codeChallengeMethod string
-	if p.provider.Data().CodeChallengeMethod != "" {
-		codeChallengeMethod = p.provider.Data().CodeChallengeMethod
+	if p.providerMap[providerID].Data().CodeChallengeMethod != "" {
+		codeChallengeMethod = p.providerMap[providerID].Data().CodeChallengeMethod
 		preEncodedCodeVerifier, err := encryption.Nonce(96)
 		if err != nil {
 			logger.Errorf("Unable to build random string: %v", err)
@@ -748,7 +782,7 @@ func (p *OAuthProxy) doOAuthStart(rw http.ResponseWriter, req *http.Request, ove
 		}
 		codeVerifier = base64.RawURLEncoding.EncodeToString(preEncodedCodeVerifier)
 
-		codeChallenge, err = encryption.GenerateCodeChallenge(p.provider.Data().CodeChallengeMethod, codeVerifier)
+		codeChallenge, err = encryption.GenerateCodeChallenge(p.providerMap[providerID].Data().CodeChallengeMethod, codeVerifier)
 		if err != nil {
 			logger.Errorf("Error creating code challenge: %v", err)
 			p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
@@ -774,9 +808,9 @@ func (p *OAuthProxy) doOAuthStart(rw http.ResponseWriter, req *http.Request, ove
 	}
 
 	callbackRedirect := p.getOAuthRedirectURI(req)
-	loginURL := p.provider.GetLoginURL(
+	loginURL := p.providerMap[providerID].GetLoginURL(
 		callbackRedirect,
-		encodeState(csrf.HashOAuthState(), appRedirect),
+		encodeState(csrf.HashOAuthState(), appRedirect, providerID),
 		csrf.HashOIDCNonce(),
 		extraParams,
 	)
@@ -813,17 +847,25 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 	csrf, err := cookies.LoadCSRFCookie(req, p.CookieOptions)
 	if err != nil {
-		logger.Println(req, logger.AuthFailure, "Invalid authentication via OAuth2: unable to obtain CSRF cookie")
-		p.ErrorPage(rw, req, http.StatusForbidden, err.Error(), "Login Failed: Unable to find a valid CSRF token. Please try again.")
+		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error(), "Login Failed: Unable to load CSRF token. Please try again.")
 		return
 	}
 
-	session, err := p.redeemCode(req, csrf.GetCodeVerifier())
+	nonce, appRedirect, providerID, err := decodeState(req)
 	if err != nil {
-		logger.Errorf("Error redeeming code during OAuth2 callback: %v", err)
+		logger.Println(req, logger.AuthFailure, "Invalid authentication via OAuth2: unable to decode state")
+		p.ErrorPage(rw, req, http.StatusForbidden, err.Error(), "Login Failed: Unable to decode the state. Please try again.")
+		return
+	}
+
+	session, err := p.redeemCode(req, providerID, csrf.GetCodeVerifier())
+	if err != nil {
+		logger.Errorf("Error while parsing OAuth2 state: %v", err)
 		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	logger.Println(session)
 
 	err = p.enrichSessionState(req.Context(), session)
 	if err != nil {
@@ -834,13 +876,6 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 
 	csrf.ClearCookie(rw, req)
 
-	nonce, appRedirect, err := decodeState(req)
-	if err != nil {
-		logger.Errorf("Error while parsing OAuth2 state: %v", err)
-		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
-		return
-	}
-
 	if !csrf.CheckOAuthState(nonce) {
 		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: CSRF token mismatch, potential attack")
 		p.ErrorPage(rw, req, http.StatusForbidden, "CSRF token mismatch, potential attack", "Login Failed: Unable to find a valid CSRF token. Please try again.")
@@ -848,7 +883,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	csrf.SetSessionNonce(session)
-	if !p.provider.ValidateSession(req.Context(), session) {
+	if !p.providerMap[providerID].ValidateSession(req.Context(), session) {
 		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Session validation failed: %s", session)
 		p.ErrorPage(rw, req, http.StatusForbidden, "Session validation failed")
 		return
@@ -859,7 +894,7 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// set cookie, or deny
-	authorized, err := p.provider.Authorize(req.Context(), session)
+	authorized, err := p.providerMap[providerID].Authorize(req.Context(), session)
 	if err != nil {
 		logger.Errorf("Error with authorization: %v", err)
 	}
@@ -878,14 +913,15 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func (p *OAuthProxy) redeemCode(req *http.Request, codeVerifier string) (*sessionsapi.SessionState, error) {
+func (p *OAuthProxy) redeemCode(req *http.Request, providerID string, codeVerifier string) (*sessionsapi.SessionState, error) {
 	code := req.Form.Get("code")
 	if code == "" {
 		return nil, providers.ErrMissingCode
 	}
 
 	redirectURI := p.getOAuthRedirectURI(req)
-	s, err := p.provider.Redeem(req.Context(), redirectURI, code, codeVerifier)
+	s, err := p.providerMap[providerID].Redeem(req.Context(), redirectURI, code, codeVerifier)
+
 	if err != nil {
 		return nil, err
 	}
@@ -898,6 +934,8 @@ func (p *OAuthProxy) redeemCode(req *http.Request, codeVerifier string) (*sessio
 		s.ExpiresIn(p.CookieOptions.Expire)
 	}
 
+	s.ProviderID = providerID
+
 	return s, nil
 }
 
@@ -906,13 +944,13 @@ func (p *OAuthProxy) enrichSessionState(ctx context.Context, s *sessionsapi.Sess
 	if s.Email == "" {
 		// TODO(@NickMeves): Remove once all provider are updated to implement EnrichSession
 		// nolint:staticcheck
-		s.Email, err = p.provider.GetEmailAddress(ctx, s)
+		s.Email, err = p.providerMap[s.ProviderID].GetEmailAddress(ctx, s)
 		if err != nil && !errors.Is(err, providers.ErrNotImplemented) {
 			return err
 		}
 	}
 
-	return p.provider.EnrichSession(ctx, s)
+	return p.providerMap[s.ProviderID].EnrichSession(ctx, s)
 }
 
 // AuthOnly checks whether the user is currently logged in (both authentication
@@ -961,7 +999,7 @@ func (p *OAuthProxy) Proxy(rw http.ResponseWriter, req *http.Request) {
 			// start OAuth flow, but only with the default login URL params - do not
 			// consider this request's query params as potential overrides, since
 			// the user did not explicitly start the login flow
-			p.doOAuthStart(rw, req, nil)
+			p.doOAuthStart(rw, req, session.ProviderID, nil)
 		} else {
 			p.SignInPage(rw, req, http.StatusForbidden)
 		}
@@ -1047,7 +1085,7 @@ func (p *OAuthProxy) getAuthenticatedSession(rw http.ResponseWriter, req *http.R
 	}
 
 	invalidEmail := session.Email != "" && !p.Validator(session.Email)
-	authorized, err := p.provider.Authorize(req.Context(), session)
+	authorized, err := p.providerMap[session.ProviderID].Authorize(req.Context(), session)
 	if err != nil {
 		logger.Errorf("Error with authorization: %v", err)
 	}
@@ -1169,18 +1207,18 @@ func checkAllowedEmails(req *http.Request, s *sessionsapi.SessionState) bool {
 
 // encodedState builds the OAuth state param out of our nonce and
 // original application redirect
-func encodeState(nonce string, redirect string) string {
-	return fmt.Sprintf("%v:%v", nonce, redirect)
+func encodeState(nonce string, redirect string, id string) string {
+	return fmt.Sprintf("%v:%v:%v", nonce, redirect, id)
 }
 
 // decodeState splits the reflected OAuth state response back into
 // the nonce and original application redirect
-func decodeState(req *http.Request) (string, string, error) {
-	state := strings.SplitN(req.Form.Get("state"), ":", 2)
-	if len(state) != 2 {
-		return "", "", errors.New("invalid length")
+func decodeState(req *http.Request) (string, string, string, error) {
+	state := strings.SplitN(req.Form.Get("state"), ":", 3)
+	if len(state) != 3 {
+		return "", "", "", errors.New("invalid length")
 	}
-	return state[0], state[1], nil
+	return state[0], state[1], state[2], nil
 }
 
 // addHeadersForProxying adds the appropriate headers the request / response for proxying
